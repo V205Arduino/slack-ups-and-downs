@@ -2,6 +2,7 @@ import bolt from "@slack/bolt";
 const { App } = bolt;
 import env from "./utils/env.js";
 import { PrismaClient, Team } from "@prisma/client";
+import Cron from "croner";
 
 const app = new App({
   token: env.WORKSPACE_BOT_TOKEN,
@@ -17,22 +18,23 @@ app.event("app_mention", async ({ event, client }) => {
   });
 });
 
-let game = await prisma.game.findFirstOrThrow();
+const game = await prisma.game.findFirstOrThrow();
+const id = game.id;
+let number = game.number;
+let lastCounter = game.lastCounter;
+let upTeamMembers = game.upTeamMembers;
+let downTeamMembers = game.downTeamMembers;
+let upTeamWins = game.upTeamWins;
+let downTeamWins = game.downTeamWins;
+
 app.message(/^-?\d+(\s+.*)?/, async ({ message, say, client }) => {
   if (message.channel != env.CHANNEL_ID) return;
-  if (
-    !(
-      message.subtype === undefined ||
-      message.subtype === "bot_message" ||
-      message.subtype === "file_share" ||
-      message.subtype === "thread_broadcast"
-    )
-  )
-    return;
+  if (!(message.subtype === undefined)) return;
+  if (message.thread_ts) return;
   const team = await getTeam(message.user!);
   const num = parseInt(message.text!);
-  const target = team == "UP" ? game.number + 1 : game.number - 1;
-  if (message.user == game.lastCounter) {
+  const target = team == "UP" ? number + 1 : number - 1;
+  if (message.user == lastCounter) {
     youScrewedUp(message, say, team, "You can't count twice in a row!");
     return;
   }
@@ -49,45 +51,64 @@ app.message(/^-?\d+(\s+.*)?/, async ({ message, say, client }) => {
     );
     return;
   }
-  game = await prisma.game.update({
+  number = target;
+  lastCounter = message.user ?? null;
+  await prisma.game.update({
     where: {
-      id: game.id,
+      id,
     },
     data: {
       number: target,
       lastCounter: message.user,
     },
   });
+  await prisma.user.update({
+    where: {
+      id: message.user,
+    },
+    data: {
+      countsThisMonth: {
+        increment: 1,
+      },
+    },
+  });
+
   if (target == 100) {
-    game = await prisma.game.update({
+    number = 0;
+    lastCounter = null;
+    upTeamWins++;
+    await prisma.game.update({
       where: {
-        id: game.id,
+        id,
       },
       data: {
         number: 0,
         lastCounter: null,
-        upTeamWins: game.upTeamWins + 1,
+        upTeamWins: upTeamWins + 1,
       },
     });
     client.chat.postMessage({
       channel: message.channel,
-      text: `And that's a win for team UP! Great job, everyone!\nThe game has been reset. The next number is 1 or -1, depending on your team.\n\nUP team wins: ${game.upTeamWins}\nDOWN team wins: ${game.downTeamWins}`,
+      text: `And that's a win for team UP! Great job, everyone!\nThe game has been reset. The next number is 1 or -1, depending on your team.\n\nUP team wins: ${upTeamWins}\nDOWN team wins: ${downTeamWins}`,
     });
   }
   if (target == -100) {
-    game = await prisma.game.update({
+    number = 0;
+    lastCounter = null;
+    downTeamWins++;
+    await prisma.game.update({
       where: {
-        id: game.id,
+        id,
       },
       data: {
         number: 0,
         lastCounter: null,
-        downTeamWins: game.downTeamWins + 1,
+        downTeamWins: downTeamWins + 1,
       },
     });
     client.chat.postMessage({
       channel: message.channel,
-      text: `And that's a win for team DOWN! Great job, everyone!\nThe game has been reset. The next number is 1 or -1, depending on your team.\n\nUP team wins: ${game.upTeamWins}\nDOWN team wins: ${game.downTeamWins}`,
+      text: `And that's a win for team DOWN! Great job, everyone!\nThe game has been reset. The next number is 1 or -1, depending on your team.\n\nUP team wins: ${upTeamWins}\nDOWN team wins: ${downTeamWins}`,
     });
   }
 });
@@ -112,43 +133,152 @@ app.event("member_joined_channel", async ({ event }) => {
   getTeam(event.user);
 });
 
-const getTeam = async (id: string, notifyOnCreate = true) => {
+const getTheLeadersOfTheBoard = async (userId: string) => {
+  const blocks: (bolt.Block | bolt.KnownBlock)[] = [
+    {
+      type: "header",
+      text: {
+        type: "plain_text",
+        text: `Up vs. Down Leaderboard - ${new Date().toLocaleString("en-us", {
+          month: "long",
+        })} ${new Date().getFullYear()}`,
+        emoji: true,
+      },
+    },
+    {
+      type: "section",
+      fields: [
+        {
+          type: "mrkdwn",
+          text: `*UP* team wins: ${upTeamWins}`,
+        },
+        {
+          type: "mrkdwn",
+          text: `*DOWN* team wins: ${downTeamWins}`,
+        },
+      ],
+    },
+    {
+      type: "divider",
+    },
+  ];
+  const users = await prisma.user.findMany({
+    orderBy: {
+      countsThisMonth: "desc",
+    },
+  });
+  let pos = 0;
+  let addedFetcher = false;
+  for (const user of users) {
+    pos++;
+    if (pos > 10) break;
+
+    let bold = false;
+    if (user.id == userId) {
+      bold = true;
+      addedFetcher = true;
+    }
+    if (pos == 1) bold = true;
+    blocks.push({
+      type: "section",
+      text: {
+        type: "mrkdwn",
+        text: bold
+          ? `*${pos}. <@${user.id}> - ${user.countsThisMonth} for team ${user.team}*`
+          : `${pos}. <@${user.id}> - ${user.countsThisMonth} for team ${user.team}`,
+      },
+    });
+  }
+
+  if (!addedFetcher) {
+    const fetcher = users.find((user) => user.id == userId);
+    if (!fetcher) return blocks;
+    blocks.push({
+      type: "divider",
+    });
+    blocks.push({
+      type: "section",
+      text: {
+        type: "mrkdwn",
+        text: `*${users.indexOf(fetcher) + 1}. <@${fetcher.id}> - ${
+          fetcher?.countsThisMonth
+        } for team ${fetcher?.team}*`,
+      },
+    });
+  }
+  return blocks;
+};
+
+app.command("/leaderboard", async ({ command, ack, respond }) => {
+  await ack();
+  const blocks = await getTheLeadersOfTheBoard(command.user_id);
+  return await respond({ blocks });
+});
+
+app.event("app_home_opened", async ({ event, client }) => {
+  const blocks = await getTheLeadersOfTheBoard(event.user);
+  client.views.publish({
+    user_id: event.user,
+    view: {
+      type: "home",
+      blocks,
+    },
+  });
+});
+
+const resetLeaderboard = async () => {
+  await prisma.user.updateMany({
+    data: {
+      countsThisMonth: 0,
+    },
+  });
+  await app.client.chat.postMessage({
+    channel: env.CHANNEL_ID,
+    text: `Leaderboard reset! Happy ${new Date().toLocaleString("en-us", {
+      month: "long",
+    })}!`,
+  });
+};
+Cron("0 0 1 * *", resetLeaderboard);
+
+const getTeam = async (uid: string, notifyOnCreate = true) => {
   const user = await prisma.user.findUnique({
     where: {
-      id,
+      id: uid,
     },
   });
   if (user) return user.team;
   let team: Team;
-  if (game.upTeamMembers > game.downTeamMembers) {
+  if (upTeamMembers > downTeamMembers) {
     team = "DOWN";
-  } else if (game.upTeamMembers < game.downTeamMembers) {
+  } else if (upTeamMembers < downTeamMembers) {
     team = "UP";
   } else {
     const num = Math.floor(Math.random() * 2);
     team = num == 0 ? "UP" : "DOWN";
   }
-  game = await prisma.game.update({
+  upTeamMembers = team == "UP" ? upTeamMembers + 1 : upTeamMembers;
+  downTeamMembers = team == "DOWN" ? downTeamMembers + 1 : downTeamMembers;
+  await prisma.game.update({
     where: {
-      id: game.id,
+      id,
     },
     data: {
-      upTeamMembers: team == "UP" ? game.upTeamMembers + 1 : game.upTeamMembers,
-      downTeamMembers:
-        team == "DOWN" ? game.downTeamMembers + 1 : game.downTeamMembers,
+      upTeamMembers: team == "UP" ? upTeamMembers + 1 : upTeamMembers,
+      downTeamMembers: team == "DOWN" ? downTeamMembers + 1 : downTeamMembers,
     },
   });
 
   await prisma.user.create({
     data: {
-      id,
+      id: uid,
       team,
     },
   });
   if (notifyOnCreate) {
     app.client.chat.postEphemeral({
       channel: env.CHANNEL_ID,
-      user: id,
+      user: uid,
       text: "You're on team " + team + "!",
     });
   }
@@ -189,19 +319,19 @@ const youScrewedUp = async (
     });
     return;
   } else {
+    const newNumber = team == "UP" ? number - 5 : number + 5;
     say({
-      text: `${reason}\nAs punishment for your wrongdoing I'm moving the game 5 points in the other direction. Counting resumes from ${
-        team == "UP" ? game.number - 5 : game.number + 5
-      }, meaning the next number is ${game.number - 4} or ${
-        game.number + 6
-      } depending on your team.`,
+      text: `${reason}\nAs punishment for your wrongdoing I'm moving the game 5 points in the other direction. Counting resumes from ${newNumber}, meaning the next number is ${
+        newNumber - 1
+      } or ${newNumber + 1} depending on your team.`,
     });
-    game = await prisma.game.update({
+    number = newNumber;
+    await prisma.game.update({
       where: {
-        id: game.id,
+        id,
       },
       data: {
-        number: team == "UP" ? game.number - 5 : game.number + 5,
+        number: newNumber,
       },
     });
     return;
